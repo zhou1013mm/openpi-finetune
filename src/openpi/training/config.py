@@ -928,7 +928,7 @@ _CONFIGS = [
         num_train_steps=10_000,
         batch_size=16,
         wandb_entity="231840287-nanjing-university",
-        fsdp_devices = 8,   # GPU number for FSDP training
+        fsdp_devices = 4,   # GPU number for FSDP training
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
