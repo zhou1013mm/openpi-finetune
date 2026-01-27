@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -52,17 +53,20 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.init(mode="disabled")
         return
 
+    wandb_entity = os.getenv("WANDB_ENTITY") or config.wandb_entity
+
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, entity=wandb_entity)
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            entity=wandb_entity,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -140,6 +144,7 @@ def train_step(
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    lr_schedule = config.lr_schedule.create()
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
@@ -185,6 +190,7 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "lr": lr_schedule(state.step),
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
@@ -226,12 +232,16 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Log images from first batch to sanity check (best-effort, keep memory small).
+    if config.wandb_enabled:
+        try:
+            first_images = {k: jax.device_get(v[:1]) for k, v in batch[0].images.items()}
+            images_to_log = [
+                wandb.Image(np.concatenate([img[0] for img in first_images.values()], axis=1))
+            ]
+            wandb.log({"camera_views": images_to_log}, step=0)
+        except Exception as exc:
+            logging.warning("Skipping image logging due to error: %s", exc)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
