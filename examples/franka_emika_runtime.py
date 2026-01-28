@@ -1,40 +1,79 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Run π₀.₅ DROID inference on a Franka arm via Deoxys.
+
+This script mirrors the RDT inference flow but uses the π₀.₅ model.
+It:
+- boots RealSense cameras via RSInterface
+- reads Franka state via Deoxys FrankaInterface
+- formats observations and feeds them to the π₀.₅ policy
+- executes predicted actions on the robot via OSC_POSE controller
+- saves camera images asynchronously
+
+Usage:
+    python examples/franka_emika_runtime.py \
+        --checkpoint_dir checkpoints/clean_cook_all/9999 \
+        --train_config pi05_droid_finetune \
+        --task clean_cook \
+        --camera_ids "[332522077725]" \
+"""
+
 import dataclasses
+import datetime
 import logging
+import queue
+import select
+import sys
+import threading
 import time
-from typing import Optional
+from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import tyro
 
-from openpi_client import action_chunk_broker
-from openpi_client import image_tools
-from openpi_client import websocket_client_policy
-from openpi_client.runtime import environment as _environment
-from openpi_client.runtime import runtime as _runtime
-from openpi_client.runtime.agents import policy_agent as _policy_agent
+import sys
+sys.path.append("/home/czhpc/deoxys_codebase/deoxys_control/deoxys")
 
 # Add deoxys to path (repo local)
-import sys
-from pathlib import Path
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEOXYS_ROOT = (_REPO_ROOT.parent / "deoxys_control" / "deoxys").resolve()
-if not _DEOXYS_ROOT.exists():
-    raise RuntimeError(
-        f"deoxys_control not found at {_DEOXYS_ROOT}. "
-        "Clone deoxys_control as a sibling of openpi-finetune."
-    )
-if str(_DEOXYS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DEOXYS_ROOT))
+# _DEOXYS_ROOT = (_REPO_ROOT.parent / "deoxys_control" / "deoxys").resolve()
+# if not _DEOXYS_ROOT.exists():
+#     raise RuntimeError(
+#         f"deoxys_control not found at {_DEOXYS_ROOT}. "
+#         "Clone deoxys_control as a sibling of openpi-finetune."
+#     )
+# if str(_DEOXYS_ROOT) not in sys.path:
+#     sys.path.insert(0, str(_DEOXYS_ROOT))
 
-from deoxys import config_root
-from deoxys.franka_interface import FrankaInterface
-from deoxys.utils import YamlConfig
+from openpi.policies import policy_config as _policy_config
+from openpi.training import config as _config
+from openpi_client import image_tools
 
 try:
-    import cv2  # type: ignore
-except Exception:  # pragma: no cover
-    cv2 = None
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+def _require_deoxys():
+    """Lazy import deoxys modules (avoid blocking on startup)."""
+    try:
+        from deoxys import config_root
+        from deoxys.franka_interface import FrankaInterface
+        from deoxys.utils import YamlConfig
+        from deoxys.utils.log_utils import get_deoxys_example_logger
+        try:
+            from spacemouse_collection_clean_table import RSInterface
+        except ImportError:
+            RSInterface = None
+        return config_root, FrankaInterface, YamlConfig, get_deoxys_example_logger, RSInterface
+    except Exception as e:
+        raise RuntimeError(
+            "Deoxys imports failed. Ensure you're on the robot machine with Deoxys installed. "
+            f"Original error: {e}"
+        )
 
 
 @dataclasses.dataclass
@@ -42,173 +81,424 @@ class Args:
     # Task / prompt
     task: str = "clean_cook"
 
-    # Policy server
-    remote_host: str = "0.0.0.0"
-    remote_port: int = 8000
-    api_key: Optional[str] = None
-
-    # Action chunking
-    action_horizon: int = 10
+    # Policy
+    checkpoint_dir: str = "checkpoints/clean_cook_all/9999"
+    train_config: str = "pi05_droid_finetune"
+    pytorch_device: str = "cuda"
 
     # Control
     control_hz: float = 15.0
-    joint_velocity_scale: float = 0.5
-    controller_type: str = "JOINT_POSITION"
+    controller_type: str = "OSC_POSE"
     interface_cfg: str = "charmander.yml"
-    controller_cfg: str = "joint-position-controller.yml"
+    controller_cfg: str = "osc-pose-controller.yml"
 
-    # Camera (serial/device id). If numeric, treated as OpenCV index.
-    exterior_camera_id: str = "33252207725"
-    # Optional extra cameras (OpenCV indices). Use -1 to disable.
-    exterior_cam_2: int = -1
-    wrist_cam: int = -1
+    # Camera (RealSense device serials)
+    camera_ids: str = "[332522077725]"
+    num_cameras: int = 1
 
     # Runtime
     max_hz: float = 15.0
-    num_episodes: int = 1
-    max_episode_steps: int = 600
+    max_duration: float = 1200.0
+    steps_per_inference: int = 1
+
+    # Logging
+    save_root: str = ""  # If empty, auto-generate from timestamp
+    
+    # Test mode (skip robot/camera, just test model)
+    test_mode: bool = False
+
+    # Logging
+    save_root: str = ""  # If empty, auto-generate from timestamp
 
 
-def _open_camera(device: str | int):
-    if isinstance(device, int) and device < 0:
-        return None
-    if cv2 is None:
-        raise RuntimeError("OpenCV is required for camera capture but is not installed.")
-    cap = cv2.VideoCapture(device)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open camera device {device}")
-    return cap
+class _AsyncImageSaver:
+    """Save images asynchronously to avoid blocking inference."""
+
+    def __init__(self, out_dir: str, max_queue: int = 256, image_format: str = "jpg"):
+        self.out_dir = out_dir
+        self.image_format = image_format.lower()
+        self._q: queue.Queue = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._dropped = 0
+
+        import os
+
+        os.makedirs(self.out_dir, exist_ok=True)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._worker, name="async_image_saver", daemon=True)
+        self._thread.start()
+
+    def submit(self, step_idx: int, images_by_key: Dict[str, Optional[np.ndarray]]) -> None:
+        """Non-blocking: if queue is full, drop the frame."""
+        if self._stop.is_set():
+            return
+
+        ts_ms = int(time.time() * 1000)
+        for key, img in images_by_key.items():
+            if img is None:
+                continue
+            item = (step_idx, ts_ms, key, np.asarray(img).copy())
+            try:
+                self._q.put_nowait(item)
+            except queue.Full:
+                self._dropped += 1
+                return
+
+    def stop(self, drain: bool = True, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if drain:
+            t0 = time.time()
+            while (not self._q.empty()) and (time.time() - t0 < timeout):
+                time.sleep(0.01)
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def stats(self) -> Dict[str, Any]:
+        return {"dropped": self._dropped, "queued": self._q.qsize(), "out_dir": self.out_dir}
+
+    def _worker(self) -> None:
+        while True:
+            if self._stop.is_set() and self._q.empty():
+                break
+            try:
+                step_idx, ts_ms, key, img = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                if Image is None:
+                    continue
+                pil = Image.fromarray(img)
+                import os
+
+                subdir = os.path.join(self.out_dir, key)
+                os.makedirs(subdir, exist_ok=True)
+                fname = f"step_{step_idx:06d}_t{ts_ms}.{self.image_format}"
+                fpath = os.path.join(subdir, fname)
+                if self.image_format in {"jpg", "jpeg"}:
+                    pil.save(fpath, quality=95)
+                else:
+                    pil.save(fpath)
+            except Exception:
+                pass
+            finally:
+                self._q.task_done()
 
 
-def _read_camera(cap, fallback_shape=(224, 224, 3)) -> np.ndarray:
-    if cap is None:
-        return np.zeros(fallback_shape, dtype=np.uint8)
-    ret, frame = cap.read()
-    if not ret:
-        return np.zeros(fallback_shape, dtype=np.uint8)
-    # BGR -> RGB
-    frame = frame[:, :, ::-1]
-    return frame
+class _KeyboardQuitter:
+    """Sets an event when user presses 'q' (or types 'q' + Enter)."""
+
+    def __init__(self):
+        self.quit_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="keyboard_quit", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            if sys.stdin is None:
+                return
+            if sys.stdin.isatty():
+                import select
+
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    while not self.quit_event.is_set():
+                        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if not r:
+                            continue
+                        ch = sys.stdin.read(1)
+                        if ch and ch.lower() == "q":
+                            self.quit_event.set()
+                            return
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            else:
+                for line in sys.stdin:
+                    if line.strip().lower() == "q":
+                        self.quit_event.set()
+                        return
+        except Exception:
+            return
 
 
-class FrankaDeoxysEnvironment(_environment.Environment):
-    def __init__(self, args: Args) -> None:
-        self._args = args
-        self._robot = FrankaInterface(
-            config_root + f"/{args.interface_cfg}",
-            control_freq=args.control_hz,
-            use_visualizer=False,
-        )
-        self._controller_cfg = YamlConfig(config_root + f"/{args.controller_cfg}").as_easydict()
+def _parse_camera_ids(camera_ids_raw: str) -> List[int]:
+    """Parse camera IDs from string like '[1,2,3]' or '1,2,3'."""
+    import ast
 
-        ext1_device: str | int = args.exterior_camera_id
-        if args.exterior_camera_id.isdigit():
-            ext1_device = int(args.exterior_camera_id)
-        self._cam_ext_1 = _open_camera(ext1_device)
-        self._cam_ext_2 = _open_camera(args.exterior_cam_2)
-        self._cam_wrist = _open_camera(args.wrist_cam)
+    s = str(camera_ids_raw).strip()
+    if not s:
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        parsed = ast.literal_eval(s)
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError(f"--camera_ids must be a list, e.g. [1,2]")
+        return [int(x) for x in parsed]
+    parts = [p for p in s.replace(",", " ").split() if p]
+    return [int(p) for p in parts]
 
-        self._episode_steps = 0
 
-    def reset(self) -> None:
-        self._robot.reset()
-        self._episode_steps = 0
+def build_cameras(camera_ids: List[int], RSInterface) -> Dict[str, Any]:
+    """Build RealSense camera dict by serial ID with timeout protection."""
+    if RSInterface is None:
+        logging.warning("RSInterface not available; using dummy cameras")
+        return {f"cam_{i}": None for i in range(len(camera_ids))}
 
-    def is_episode_complete(self) -> bool:
-        if self._args.max_episode_steps > 0 and self._episode_steps >= self._args.max_episode_steps:
-            return True
-        return False
+    cam_by_key: Dict[str, Any] = {}
+    for i, serial in enumerate(camera_ids):
+        try:
+            logging.info(f"Opening camera {i} (serial={serial})...")
+            cam = RSInterface(device_id=int(serial))
+            logging.info(f"Camera {i} opened, starting stream...")
+            cam.start()
+            logging.info(f"Camera {i} stream started.")
+            cam_by_key[f"cam_{i}"] = cam
+        except Exception as e:
+            logging.warning(f"Failed to open camera {serial}: {e}; will use None")
+            cam_by_key[f"cam_{i}"] = None
+    return cam_by_key
 
-    def get_observation(self) -> dict:
-        # Wait until we have state
-        while not self._robot.received_states:
-            time.sleep(0.01)
 
-        joint_position = self._robot.last_q
-        if joint_position is None:
-            joint_position = np.zeros(7)
+def close_cameras(cam_by_key: Dict[str, Any]):
+    """Close all camera connections."""
+    for cam in cam_by_key.values():
+        if cam is not None:
+            try:
+                cam.close()
+            except Exception:
+                pass
 
-        gripper_position = self._robot.last_gripper_q
-        if gripper_position is None:
-            gripper_position = np.array([0.0])
+
+def fetch_camera_images(cam_by_key: Dict[str, Any], fallback_shape: tuple = (224, 224, 3)) -> Dict[str, np.ndarray]:
+    """Fetch latest images from all cameras."""
+    imgs: Dict[str, np.ndarray] = {}
+    for k, cam in cam_by_key.items():
+        if cam is None:
+            imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
         else:
-            gripper_position = np.array([gripper_position])
+            try:
+                last = cam.get_last_obs()
+                if last is not None and "color" in last:
+                    img = np.asarray(last["color"], dtype=np.uint8)
+                    imgs[k] = image_tools.resize_with_pad(image_tools.convert_to_uint8(img), 224, 224)
+                else:
+                    imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
+            except Exception:
+                imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
+    return imgs
 
-        ext_1 = _read_camera(self._cam_ext_1)
-        ext_2 = _read_camera(self._cam_ext_2)
-        wrist = _read_camera(self._cam_wrist)
 
-        ext_1 = image_tools.resize_with_pad(image_tools.convert_to_uint8(ext_1), 224, 224)
-        ext_2 = image_tools.resize_with_pad(image_tools.convert_to_uint8(ext_2), 224, 224)
-        wrist = image_tools.resize_with_pad(image_tools.convert_to_uint8(wrist), 224, 224)
+def fetch_franka_state(robot_interface) -> Dict[str, np.ndarray]:
+    """Fetch current Franka state (joint positions, gripper)."""
+    if len(robot_interface._state_buffer) == 0 or len(robot_interface._gripper_state_buffer) == 0:
+        raise RuntimeError("Robot state buffer empty")
 
-        return {
-            "observation/exterior_image_1_left": ext_1,
-            "observation/exterior_image_2_left": ext_2,
-            "observation/wrist_image_left": wrist,
-            "observation/joint_position": np.asarray(joint_position, dtype=np.float32),
-            "observation/gripper_position": np.asarray(gripper_position, dtype=np.float32),
-            "prompt": self._args.task,
-        }
+    q = np.asarray(robot_interface._state_buffer[-1].q, dtype=np.float32)
+    grip_width = float(robot_interface._gripper_state_buffer[-1].width)
 
-    def apply_action(self, action: dict) -> None:
-        self._episode_steps += 1
+    return {
+        "joint_position": q,
+        "gripper_position": np.array([grip_width], dtype=np.float32),
+    }
 
-        action_vec = action.get("actions")
-        if action_vec is None:
-            action_vec = action.get("action")
-        if action_vec is None:
-            raise ValueError("Policy action dict must contain 'actions' or 'action'.")
 
-        action_vec = np.asarray(action_vec).reshape(-1)
-        if action_vec.shape[0] < 7:
-            raise ValueError(f"Expected at least 7 action dims, got {action_vec.shape[0]}")
+def reset_robot_to_home(robot_interface, config_root: Path, logger, YamlConfig) -> None:
+    """Reset robot to home position using JOINT_POSITION controller."""
+    reset_joint_positions = [
+        0.09162008114028396,
+        -0.19826458111314524,
+        -0.01990020486871322,
+        -2.4732269941140346,
+        -0.01307073642274261,
+        2.30396583422025,
+        0.8480939705504309,
+    ]
 
-        # Convert normalized joint velocity to joint position target
-        current_q = self._robot.last_q
-        if current_q is None:
-            current_q = np.zeros(7)
+    # Add slight random variation
+    reset_joint_positions = [
+        e + float(np.clip(np.random.randn() * 0.005, -0.005, 0.005)) for e in reset_joint_positions
+    ]
 
-        joint_vel = action_vec[:7] * self._args.joint_velocity_scale
-        target_q = current_q + joint_vel * (1.0 / self._args.control_hz)
+    while robot_interface.state_buffer_size == 0:
+        logger.warn("Robot state not received")
+        time.sleep(0.5)
 
-        # Gripper: >0.5 grasp, else open
-        gripper_cmd = 1.0 if action_vec[-1] > 0.5 else -1.0
+    action = reset_joint_positions + [-1.0]
+    joint_pos_cfg = YamlConfig(str(config_root / "joint-position-controller.yml")).as_easydict()
 
-        ctrl_action = target_q.tolist() + [gripper_cmd]
-        self._robot.control(
-            controller_type=self._args.controller_type,
-            action=ctrl_action,
-            controller_cfg=self._controller_cfg,
+    logger.info("Resetting to home position...")
+    while True:
+        robot_interface.control(
+            controller_type="JOINT_POSITION",
+            action=action,
+            controller_cfg=joint_pos_cfg,
         )
+        if len(robot_interface._state_buffer) > 0:
+            if np.max(np.abs(np.array(robot_interface._state_buffer[-1].q) - np.array(reset_joint_positions))) < 1e-3:
+                break
+    time.sleep(0.5)
+    logger.info("Robot at home.")
+
+
+def apply_action(robot_interface, controller_type: str, controller_cfg, action_vec: np.ndarray, logger):
+    """Send action to robot."""
+    action_vec = np.asarray(action_vec, dtype=np.float64).reshape(-1)
+    try:
+        robot_interface.control(controller_type=controller_type, action=action_vec.tolist(), controller_cfg=controller_cfg)
+    except Exception as e:
+        logger.error(f"Failed to apply action: {e}")
 
 
 def main(args: Args) -> None:
-    env = FrankaDeoxysEnvironment(args)
+    logging.basicConfig(level=logging.INFO, force=True)
+    
+    # Lazy import deoxys (happens here, not at startup)
+    print("Importing deoxys...")
+    config_root, FrankaInterface, YamlConfig, get_deoxys_example_logger, RSInterface = _require_deoxys()
+    print("Deoxys imported successfully.")
+    config_root = Path(config_root)
+    logger = get_deoxys_example_logger()
+    logger.info("Deoxys logger initialized.")
 
-    policy = websocket_client_policy.WebsocketClientPolicy(
-        host=args.remote_host,
-        port=args.remote_port,
-        api_key=args.api_key,
+    # Setup output directory
+    if not args.save_root:
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.save_root = f"outputs/franka_pi05_inference_{run_id}"
+    images_out_dir = f"{args.save_root}/camera_images"
+
+    logger.info(f"Saving outputs to: {args.save_root}")
+    logger.info(f"Saving camera images to: {images_out_dir}")
+
+    # Setup async workers
+    image_saver = _AsyncImageSaver(out_dir=images_out_dir, max_queue=256, image_format="jpg")
+    image_saver.start()
+
+    quitter = _KeyboardQuitter()
+    quitter.start()
+    logger.info("Press 'q' to quit.")
+
+    # Load policy from checkpoint
+    checkpoint_path = (_REPO_ROOT / args.checkpoint_dir).resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
+
+    logger.info(f"Loading policy from {checkpoint_path}...")
+    train_cfg = _config.get_config(args.train_config)
+    policy = _policy_config.create_trained_policy(
+        train_cfg,
+        checkpoint_path,
+        default_prompt=args.task,
+        pytorch_device=args.pytorch_device,
     )
+    logger.info("Policy loaded.")
 
-    agent = _policy_agent.PolicyAgent(
-        policy=action_chunk_broker.ActionChunkBroker(
-            policy=policy,
-            action_horizon=args.action_horizon,
-        )
-    )
+    # Setup cameras
+    camera_ids = _parse_camera_ids(args.camera_ids)
+    cam_by_key = build_cameras(camera_ids, RSInterface)
+    logger.info(f"Initialized {len(cam_by_key)} camera(s).")
 
-    runtime = _runtime.Runtime(
-        environment=env,
-        agent=agent,
-        subscribers=[],
-        max_hz=args.max_hz,
-        num_episodes=args.num_episodes,
-        max_episode_steps=args.max_episode_steps,
-    )
+    # Setup robot
+    interface_cfg_path = args.interface_cfg
+    if not interface_cfg_path.startswith("/"):
+        interface_cfg_path = str(config_root / interface_cfg_path)
+    robot_interface = FrankaInterface(interface_cfg_path)
+    logger.info("Franka interface initialized.")
 
-    runtime.run()
+    controller_cfg_obj = YamlConfig(str(config_root / args.controller_cfg)).as_easydict()
+    logger.info(f"Using controller: {args.controller_type}")
+
+    obs_window: deque = deque(maxlen=2)
+    t_start = time.monotonic()
+
+    try:
+        reset_robot_to_home(robot_interface, config_root, logger, YamlConfig)
+
+        # Warm up observation buffer
+        logger.info("Warming up observations...")
+        while len(obs_window) < 2:
+            imgs = fetch_camera_images(cam_by_key)
+            image_saver.submit(step_idx=-1, images_by_key=imgs)
+            state = fetch_franka_state(robot_interface)
+            obs_window.append({"images": imgs, "state": state})
+            time.sleep(0.05)
+
+        logger.info("Starting control loop...")
+        step_idx = 0
+
+        while (time.monotonic() - t_start) < args.max_duration:
+            if quitter.quit_event.is_set():
+                logger.info("Quit requested. Exiting control loop...")
+                break
+
+            imgs = fetch_camera_images(cam_by_key)
+            image_saver.submit(step_idx=step_idx, images_by_key=imgs)
+            state = fetch_franka_state(robot_interface)
+            obs_window.append({"images": imgs, "state": state})
+
+            if len(obs_window) < 2:
+                time.sleep(0.01)
+                continue
+
+            curr = obs_window[-1]
+
+            # Prepare observation dict for policy
+            obs = {
+                "observation/exterior_image_1_left": curr["images"].get("cam_0", np.zeros((224, 224, 3), dtype=np.uint8)),
+                "observation/exterior_image_2_left": curr["images"].get("cam_1", np.zeros((224, 224, 3), dtype=np.uint8)),
+                "observation/wrist_image_left": curr["images"].get("cam_2", np.zeros((224, 224, 3), dtype=np.uint8)),
+                "observation/joint_position": curr["state"]["joint_position"],
+                "observation/gripper_position": curr["state"]["gripper_position"],
+                "prompt": args.task,
+            }
+
+            # Inference
+            try:
+                result = policy.infer(obs)
+                action_seq = result["actions"]  # Shape: (horizon, action_dim)
+            except Exception as e:
+                logger.error(f"Policy inference failed: {e}")
+                break
+
+            # Execute actions
+            k_exec = max(1, min(args.steps_per_inference, int(action_seq.shape[0])))
+            for k in range(k_exec):
+                if quitter.quit_event.is_set():
+                    logger.info("Quit requested. Exiting control loop...")
+                    raise KeyboardInterrupt
+
+                action = np.asarray(action_seq[k], dtype=np.float64)
+                apply_action(robot_interface, args.controller_type, controller_cfg_obj, action, logger)
+
+            step_idx += 1
+            if step_idx % 100 == 0:
+                logger.info(f"Step {step_idx}, elapsed time: {(time.monotonic() - t_start) / 60:.1f} min")
+
+    finally:
+        logger.info("Shutting down...")
+        try:
+            image_saver.stop(drain=True, timeout=5.0)
+            logger.info(f"Image saver stats: {image_saver.stats()}")
+        except Exception:
+            pass
+        close_cameras(cam_by_key)
+        try:
+            robot_interface.close()
+        except Exception:
+            pass
+        logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
