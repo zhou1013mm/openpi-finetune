@@ -12,6 +12,14 @@ Expected files in data_dir (prefix can be any string, e.g., testing_demo):
 
 Usage:
   .venv/bin/python scripts/convert_run_dir_to_lerobot.py --data-dir /path/to/run1 --repo-id <org>/<name>
+
+Example:
+    HF_LEROBOT_HOME=/data0/guojia/.cache/huggingface/lerobot \
+    .venv/bin/python scripts/convert_run_dir_to_lerobot.py  --data-dir /data0/guojia/robotics/code/RoboticsDiffusionTransformer/datasets/clean_cook \
+    --repo-id zhou_clean_cook_all \
+    --overwrite \
+    --action-type joint_position \
+    --fps 5
 """
 
 from __future__ import annotations
@@ -31,6 +39,59 @@ def _load_npz(path: Path) -> np.ndarray:
     if "data" not in data:
         raise ValueError(f"Expected key 'data' in {path}")
     return data["data"]
+
+
+def _ee16_to_pose(ee16: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert flattened 4x4 EE matrix to (R, p) with simple layout heuristic."""
+    mat = np.asarray(ee16, dtype=np.float32).reshape(4, 4)
+    br_ok = np.isfinite(mat[3, 3]) and (abs(float(mat[3, 3]) - 1.0) < 1e-2)
+    last_col_small = float(np.linalg.norm(mat[:3, 3])) < 1e-3
+    last_row_large = float(np.linalg.norm(mat[3, :3])) > 1e-4
+    if br_ok and last_col_small and last_row_large:
+        mat = mat.T
+    return mat[:3, :3], mat[:3, 3]
+
+
+def _axis_angle_from_rot(R: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix to axis-angle vector (axis * angle)."""
+    trace = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    angle = float(np.arccos(trace))
+    if angle < 1e-6:
+        return np.zeros(3, dtype=np.float32)
+    axis = np.array(
+        [R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]], dtype=np.float32
+    )
+    axis = axis / (2.0 * np.sin(angle))
+    return axis * angle
+
+
+def _compute_joint_position_actions(joint: np.ndarray, gripper: np.ndarray) -> np.ndarray:
+    """Create joint position actions (T, 8) from joint + gripper position."""
+    if joint.ndim != 2 or joint.shape[1] != 7:
+        raise ValueError(f"Expected joint_states shape (T, 7), got {joint.shape}")
+    if gripper.ndim == 1:
+        gripper = gripper[:, None]
+    if gripper.shape[0] != joint.shape[0]:
+        raise ValueError("Mismatched joint and gripper lengths")
+    actions = np.zeros((joint.shape[0], 8), dtype=np.float32)
+    actions[:, :7] = joint.astype(np.float32)
+    actions[:, 7] = gripper[:, 0].astype(np.float32)
+    return actions
+
+
+def _compute_joint_velocity_actions(joint: np.ndarray, gripper: np.ndarray, fps: int) -> np.ndarray:
+    """Compute joint velocity actions (T, 8) from joint position + gripper position."""
+    if joint.ndim != 2 or joint.shape[1] != 7:
+        raise ValueError(f"Expected joint_states shape (T, 7), got {joint.shape}")
+    if gripper.ndim == 1:
+        gripper = gripper[:, None]
+    if gripper.shape[0] != joint.shape[0]:
+        raise ValueError("Mismatched joint and gripper lengths")
+    dt = 1.0 / float(fps)
+    actions = np.zeros((joint.shape[0], 8), dtype=np.float32)
+    actions[1:, :7] = (joint[1:] - joint[:-1]) / dt
+    actions[1:, 7] = (gripper[1:, 0] - gripper[:-1, 0]) / dt
+    return actions.astype(np.float32)
 
 
 def _find_prefixes(data_dir: Path) -> List[str]:
@@ -98,6 +159,7 @@ def main(
     run_start: int | None = None,
     run_end: int | None = None,
     droid_format: bool = True,
+    action_type: str = "raw",
 ):
     data_dir = Path(data_dir)
     if not data_dir.exists():
@@ -227,6 +289,15 @@ def main(
             gripper = _load_npz(run_dir / f"{prefix}_gripper_states.npz").astype(np.float32)
             if gripper.ndim == 1:
                 gripper = gripper[:, None]
+
+            if action_type == "joint_position":
+                action = _compute_joint_position_actions(joint, gripper)
+            elif action_type == "joint_velocity":
+                action = _compute_joint_velocity_actions(joint, gripper, fps)
+            elif action_type != "raw":
+                raise ValueError(
+                    f"Unsupported action_type: {action_type}. Use 'raw', 'joint_position', or 'joint_velocity'."
+                )
 
             cams = {name: _load_npz(path) for name, path in _get_camera_files(run_dir, prefix).items()}
             if not cams:
