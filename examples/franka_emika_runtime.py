@@ -12,7 +12,7 @@ It:
 
 Usage:
     python examples/franka_emika_runtime.py \
-        --checkpoint_dir checkpoints/clean_cook_all/9999 \
+        --checkpoint_dir checkpoints/pi05_droid_finetune/clean_cook_jointpos/9999 \
         --train_config pi05_droid_finetune \
         --task clean_cook \
         --camera_ids "[332522077725]" \
@@ -82,15 +82,15 @@ class Args:
     task: str = "clean_cook"
 
     # Policy
-    checkpoint_dir: str = "checkpoints/clean_cook_all/9999"
+    checkpoint_dir: str = "checkpoints/pi05_droid_finetune/clean_cook_jointpos/9999"
     train_config: str = "pi05_droid_finetune"
     pytorch_device: str = "cuda"
 
     # Control
     control_hz: float = 15.0
-    controller_type: str = "OSC_POSE"
+    controller_type: str = "JOINT_POSITION"
     interface_cfg: str = "charmander.yml"
-    controller_cfg: str = "osc-pose-controller.yml"
+    controller_cfg: str = "joint-position-controller.yml"
 
     # Camera (RealSense device serials)
     camera_ids: str = "[332522077725]"
