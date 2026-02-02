@@ -106,7 +106,7 @@ class Args:
     # Runtime
     max_hz: float = 5.0
     max_duration: float = 1200.0
-    steps_per_inference: int = 1
+    steps_per_inference: int = 8
 
     # Rate limiting (enforce control_hz)
     enforce_control_hz: bool = True
@@ -477,8 +477,9 @@ def main(args: Args) -> None:
 
             # Prepare observation dict for policy
             cam_0 = curr["images"].get("cam_0", np.zeros((224, 224, 3), dtype=np.uint8))
-            cam_1 = curr["images"].get("cam_1", cam_0)
-            cam_2 = curr["images"].get("cam_2", cam_0)
+            cam_blank = np.zeros_like(cam_0)
+            cam_1 = cam_blank
+            cam_2 = cam_0
             obs = {
                 "observation/exterior_image_1_left": cam_0,
                 "observation/exterior_image_2_left": cam_1,
