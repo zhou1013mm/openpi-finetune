@@ -87,19 +87,29 @@ class Args:
     pytorch_device: str = "cuda"
 
     # Control
-    control_hz: float = 15.0
+    control_hz: float = 5.0
     controller_type: str = "JOINT_POSITION"
     interface_cfg: str = "charmander.yml"
     controller_cfg: str = "joint-position-controller.yml"
+
+    # Action interpretation
+    # "joint_position" -> actions are absolute joint positions
+    # "joint_velocity" -> actions are joint velocities (integrated with control_hz)
+    action_space: str = "joint_position"
+    # Threshold (meters) for mapping gripper position to open/close command
+    gripper_open_threshold: float = 0.04
 
     # Camera (RealSense device serials)
     camera_ids: str = "[332522077725]"
     num_cameras: int = 1
 
     # Runtime
-    max_hz: float = 15.0
+    max_hz: float = 5.0
     max_duration: float = 1200.0
     steps_per_inference: int = 1
+
+    # Rate limiting (enforce control_hz)
+    enforce_control_hz: bool = True
 
     # Logging
     save_root: str = ""  # If empty, auto-generate from timestamp
@@ -315,6 +325,14 @@ def fetch_franka_state(robot_interface) -> Dict[str, np.ndarray]:
     }
 
 
+def _map_gripper_action(gripper_position: float, open_threshold: float) -> float:
+    """Map gripper position (width) to Deoxys open/close command.
+
+    Deoxys expects: action < 0 => open, action >= 0 => close.
+    """
+    return -1.0 if gripper_position >= open_threshold else 1.0
+
+
 def reset_robot_to_home(robot_interface, config_root: Path, logger, YamlConfig) -> None:
     """Reset robot to home position using JOINT_POSITION controller."""
     reset_joint_positions = [
@@ -420,6 +438,9 @@ def main(args: Args) -> None:
     controller_cfg_obj = YamlConfig(str(config_root / args.controller_cfg)).as_easydict()
     logger.info(f"Using controller: {args.controller_type}")
 
+    target_dt = 1.0 / float(args.control_hz) if args.control_hz and args.control_hz > 0 else 0.0
+    action_space = str(args.action_space).strip().lower()
+
     obs_window: deque = deque(maxlen=2)
     t_start = time.monotonic()
 
@@ -455,10 +476,13 @@ def main(args: Args) -> None:
             curr = obs_window[-1]
 
             # Prepare observation dict for policy
+            cam_0 = curr["images"].get("cam_0", np.zeros((224, 224, 3), dtype=np.uint8))
+            cam_1 = curr["images"].get("cam_1", cam_0)
+            cam_2 = curr["images"].get("cam_2", cam_0)
             obs = {
-                "observation/exterior_image_1_left": curr["images"].get("cam_0", np.zeros((224, 224, 3), dtype=np.uint8)),
-                "observation/exterior_image_2_left": curr["images"].get("cam_1", np.zeros((224, 224, 3), dtype=np.uint8)),
-                "observation/wrist_image_left": curr["images"].get("cam_2", np.zeros((224, 224, 3), dtype=np.uint8)),
+                "observation/exterior_image_1_left": cam_0,
+                "observation/exterior_image_2_left": cam_1,
+                "observation/wrist_image_left": cam_2,
                 "observation/joint_position": curr["state"]["joint_position"],
                 "observation/gripper_position": curr["state"]["gripper_position"],
                 "prompt": args.task,
@@ -479,8 +503,33 @@ def main(args: Args) -> None:
                     logger.info("Quit requested. Exiting control loop...")
                     raise KeyboardInterrupt
 
-                action = np.asarray(action_seq[k], dtype=np.float64)
-                apply_action(robot_interface, args.controller_type, controller_cfg_obj, action, logger)
+                step_t0 = time.monotonic()
+                action = np.asarray(action_seq[k], dtype=np.float64).reshape(-1)
+                if action.shape[0] < 8:
+                    raise ValueError(f"Expected action dim >= 8 (7 joints + gripper), got {action.shape[0]}")
+
+                joint_cmd = action[:7]
+                gripper_val = float(action[7])
+
+                if action_space == "joint_velocity":
+                    current_q = curr["state"]["joint_position"]
+                    target_q = current_q + joint_cmd * target_dt
+                elif action_space == "joint_position":
+                    target_q = joint_cmd
+                else:
+                    raise ValueError(
+                        f"Unknown action_space '{args.action_space}'. Use 'joint_position' or 'joint_velocity'."
+                    )
+
+                gripper_cmd = _map_gripper_action(gripper_val, args.gripper_open_threshold)
+                full_action = np.concatenate([np.asarray(target_q, dtype=np.float64), [gripper_cmd]], axis=0)
+                apply_action(robot_interface, args.controller_type, controller_cfg_obj, full_action, logger)
+
+                if args.enforce_control_hz and target_dt > 0:
+                    elapsed = time.monotonic() - step_t0
+                    sleep_dt = target_dt - elapsed
+                    if sleep_dt > 0:
+                        time.sleep(sleep_dt)
 
             step_idx += 1
             if step_idx % 100 == 0:
