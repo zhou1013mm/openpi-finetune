@@ -35,6 +35,7 @@ import tyro
 
 import sys
 sys.path.append("/home/czhpc/deoxys_codebase/deoxys_control/deoxys")
+sys.path.append(".")
 
 # Add deoxys to path (repo local)
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,8 +67,13 @@ def _require_deoxys():
         from deoxys.utils.log_utils import get_deoxys_example_logger
         try:
             from spacemouse_collection_clean_table import RSInterface
-        except ImportError:
+        except Exception as e:
             RSInterface = None
+            logging.warning(
+                "Failed to import RSInterface from spacemouse_collection_clean_table; "
+                "camera images will be dummy/blank unless test_mode=True. "
+                f"Original error: {e}"
+            )
         return config_root, FrankaInterface, YamlConfig, get_deoxys_example_logger, RSInterface
     except Exception as e:
         raise RuntimeError(
@@ -264,8 +270,11 @@ def _parse_camera_ids(camera_ids_raw: str) -> List[int]:
 def build_cameras(camera_ids: List[int], RSInterface) -> Dict[str, Any]:
     """Build RealSense camera dict by serial ID with timeout protection."""
     if RSInterface is None:
-        logging.warning("RSInterface not available; using dummy cameras")
-        return {f"cam_{i}": None for i in range(len(camera_ids))}
+        raise RuntimeError(
+            "RSInterface is not available. This will produce blank (zero) images. "
+            "Fix: ensure spacemouse_collection_clean_table.py is importable on this machine, "
+            "or run with --test_mode to skip cameras/robot." 
+        )
 
     cam_by_key: Dict[str, Any] = {}
     for i, serial in enumerate(camera_ids):
@@ -275,6 +284,24 @@ def build_cameras(camera_ids: List[int], RSInterface) -> Dict[str, Any]:
             logging.info(f"Camera {i} opened, starting stream...")
             cam.start()
             logging.info(f"Camera {i} stream started.")
+
+            # Warm-up: wait briefly for first frame
+            t0 = time.time()
+            got_frame = False
+            while time.time() - t0 < 2.0:
+                try:
+                    last = cam.get_last_obs()
+                    if last is not None and isinstance(last, dict) and ("color" in last) and (last["color"] is not None):
+                        got_frame = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            if not got_frame:
+                logging.warning(
+                    f"Camera {i} (serial={serial}) started but no 'color' frames received yet. "
+                    "If images are blank, check RealSense permissions/USB and RSInterface implementation."
+                )
             cam_by_key[f"cam_{i}"] = cam
         except Exception as e:
             logging.warning(f"Failed to open camera {serial}: {e}; will use None")
@@ -295,16 +322,31 @@ def close_cameras(cam_by_key: Dict[str, Any]):
 def fetch_camera_images(cam_by_key: Dict[str, Any], fallback_shape: tuple = (224, 224, 3)) -> Dict[str, np.ndarray]:
     """Fetch latest images from all cameras."""
     imgs: Dict[str, np.ndarray] = {}
+    # One-time warnings per camera key to reduce log spam.
+    if not hasattr(fetch_camera_images, "_warned"):
+        fetch_camera_images._warned = set()  # type: ignore[attr-defined]
     for k, cam in cam_by_key.items():
         if cam is None:
+            if k not in fetch_camera_images._warned:  # type: ignore[attr-defined]
+                logging.warning(f"Camera {k} is None (failed to open). Images will be blank.")
+                fetch_camera_images._warned.add(k)  # type: ignore[attr-defined]
             imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
         else:
             try:
                 last = cam.get_last_obs()
                 if last is not None and "color" in last:
                     img = np.asarray(last["color"], dtype=np.uint8)
+                    if (img.size == 0 or int(img.max()) == 0) and k not in fetch_camera_images._warned:  # type: ignore[attr-defined]
+                        logging.warning(
+                            f"Camera {k} returned an all-zero/empty frame (shape={getattr(img, 'shape', None)})."
+                        )
+                        fetch_camera_images._warned.add(k)  # type: ignore[attr-defined]
                     imgs[k] = image_tools.resize_with_pad(image_tools.convert_to_uint8(img), 224, 224)
                 else:
+                    if k not in fetch_camera_images._warned:  # type: ignore[attr-defined]
+                        keys = list(last.keys()) if isinstance(last, dict) else type(last)
+                        logging.warning(f"Camera {k} last_obs missing 'color' (keys={keys}). Images will be blank.")
+                        fetch_camera_images._warned.add(k)  # type: ignore[attr-defined]
                     imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
             except Exception:
                 imgs[k] = np.zeros(fallback_shape, dtype=np.uint8)
@@ -424,8 +466,13 @@ def main(args: Args) -> None:
     logger.info("Policy loaded.")
 
     # Setup cameras
-    camera_ids = _parse_camera_ids(args.camera_ids)
-    cam_by_key = build_cameras(camera_ids, RSInterface)
+    if args.test_mode:
+        logger.warning("test_mode=True: skipping camera initialization; images will be dummy/blank")
+        camera_ids = _parse_camera_ids(args.camera_ids)
+        cam_by_key = {f"cam_{i}": None for i in range(len(camera_ids))}
+    else:
+        camera_ids = _parse_camera_ids(args.camera_ids)
+        cam_by_key = build_cameras(camera_ids, RSInterface)
     logger.info(f"Initialized {len(cam_by_key)} camera(s).")
 
     # Setup robot
@@ -490,15 +537,20 @@ def main(args: Args) -> None:
             }
 
             # Inference
+            # start_infer = time.monotonic()
             try:
                 result = policy.infer(obs)
                 action_seq = result["actions"]  # Shape: (horizon, action_dim)
             except Exception as e:
                 logger.error(f"Policy inference failed: {e}")
                 break
+            # end_infer = time.monotonic()
+            # infer_dt = end_infer - start_infer
+            # logger.info(f"Inference time: {infer_dt*1000:.1f} ms")
 
             # Execute actions
             k_exec = max(1, min(args.steps_per_inference, int(action_seq.shape[0])))
+            print(f"Executing {k_exec} steps..., action_seq shape: {action_seq.shape}")
             for k in range(k_exec):
                 if quitter.quit_event.is_set():
                     logger.info("Quit requested. Exiting control loop...")
